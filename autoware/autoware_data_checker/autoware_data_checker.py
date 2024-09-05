@@ -1,8 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistWithCovarianceStamped
-from autoware_auto_vehicle_msgs.msg import VelocityReport, SteeringReport  # Old format
-# from autoware_vehicle_msgs.msg import VelocityReport, SteeringReport  # New format
+from copy import deepcopy
+
+# Old format
+from autoware_auto_vehicle_msgs.msg import VelocityReport, SteeringReport
+from autoware_auto_control_msgs.msg import AckermannControlCommand
+
+# New format
+# from autoware_vehicle_msgs.msg import VelocityReport, SteeringReport
+# from autoware_control_msgs.msg import AckermannControlCommand
+
 from sensor_msgs.msg import Imu
 import rosbag2_py
 import matplotlib.pyplot as plt
@@ -14,19 +22,86 @@ import logging
 import numpy as np
 from scipy import interpolate
 
+def moving_average( data, window_size):
+    """
+    Apply moving average filter
+    Note: with mode='same', the filter is applied for both forward and backward, which does not cause a time delay.
+    """
+    return np.convolve(data, np.ones(window_size)/window_size, mode='same')
+
+def show_result_messages(is_over_threhold):
+    if is_over_threhold:
+        print('')
+        print('Result -> NG. Needs calibration.')
+    else:
+        print('')
+        print('Result -> OK.')
+
+def calculate_scale_factor(reference_data, target_data):
+    """
+    Calculates the optimal scale factor that minimizes the difference
+    between the reference data and the target data using least squares method.
+
+    Args:
+        reference_data (numpy.array): The reference data (e.g., global_pose_yawrate).
+        target_data (numpy.array): The target data to scale (e.g., imu_yawrate).
+
+    Returns:
+        float: The calculated optimal scale factor.
+    """
+    return np.sum(reference_data * target_data) / np.sum(target_data ** 2)
+
+def resample_data(*datasets: tuple[list[float], list[float]]) -> tuple[list[float], list[list[float]]]:
+    """
+    Resample multiple datasets with a common timestamp.
+    datasets: Each dataset is passed as (timestamps, data) format.
+    Returns: Common timestamps and a list of resampled data.
+    """
+    # Determine the common time range from all datasets
+    min_timestamp = max([min(timestamps) for timestamps, _ in datasets])
+    max_timestamp = min([max(timestamps) for timestamps, _ in datasets])
+
+    # Decide the common time axis (number of elements based on the smallest dataset)
+    common_timestamps = np.linspace(min_timestamp, max_timestamp, num=min([len(data) for _, data in datasets]))
+
+    # Resample each dataset
+    resampled_data_list = []
+    for timestamps, data in datasets:
+        f_data = interpolate.interp1d(timestamps, data, fill_value="extrapolate")
+        resampled_data = f_data(common_timestamps)
+        resampled_data_list.append(resampled_data)
+
+    return common_timestamps, resampled_data_list
+
 class ROSBagAnalyzer(Node):
-    def __init__(self, rosbag_path):
+    def __init__(self, rosbag_path, non_interactive_mode):
         super().__init__('rosbag_analyzer')
         self.rosbag_path = rosbag_path
-        self.global_pose_data = []
-        self.vehicle_velocity_data = []
-        self.vehicle_steering_data = []
-        self.vehicle_velocity_converted_data = []
-        self.imu_data = []
-        self.time_stamps = []
-        self.window_size = 10  # 移動平均のウィンドウサイズ
-        # self.wheelbase = 1.087  # go-kart
-        self.wheelbase = 2.75  # jpntaxi
+        self.non_interactive_mode = non_interactive_mode
+
+        initial_data_structure = {"timestamp": [], "data": []}
+
+        self.global_pose_data = deepcopy(initial_data_structure)
+        self.global_pose_vx = deepcopy(initial_data_structure)
+        self.global_pose_vy = deepcopy(initial_data_structure)
+        self.global_pose_yawrate = deepcopy(initial_data_structure)
+        self.vehicle_velocity_data = deepcopy(initial_data_structure)
+        self.vehicle_steering_data = deepcopy(initial_data_structure)
+        self.twist_estimator_velocity_data = deepcopy(initial_data_structure)
+        self.imu_data = deepcopy(initial_data_structure)
+        self.control_cmd_data = deepcopy(initial_data_structure)
+        self.global_pose_time_stamps = []
+        self.window_size = 20  # Moving average window size
+        self.wheelbase = 1.087  # go-kart
+        # self.wheelbase = 2.75  # jpntaxi
+
+        self.figure_id = 1
+
+        self.error_threshold = {
+            "velocity": 0.2,
+            "yawrate": 0.03,
+            "steering_control": 0.03
+        }
 
         self.global_pose_topic = "/sensing/gnss/pose_with_covariance"
         # self.global_pose_topic = "/localization/pose_estimator/pose_with_covariance" # "/sensing/gnss/pose_with_covariance"
@@ -35,28 +110,53 @@ class ROSBagAnalyzer(Node):
         # self.twist_estimator_topic = "/sensing/gnss/ublox/fix_velocity" # "/sensing/vehicle_velocity_converter/twist_with_covariance"
         self.twist_estimator_topic = "/sensing/vehicle_velocity_converter/twist_with_covariance"
         self.imu_topic = "/sensing/imu/imu_data"
+        self.control_cmd = "/control/command/control_cmd"
 
-        # 必要なトピックのみをフィルタとして定義
+        # Define only the necessary topics as filters
         self.required_topics = {
             self.global_pose_topic,
             self.vehicle_velocity_topic,
             self.vehicle_steering_topic,
             self.twist_estimator_topic,
-            self.imu_topic
+            self.imu_topic,
+            self.control_cmd
         }
 
-        print("---------------------------------")
-        print("Setting:")
+        print('------------------------------------------------------------------')
+        print('Setting:')
         print(f" - wheelbase = {self.wheelbase} [m]")
         print(f" - global_pose_topic (global estimation logic e.g. NDT, GNSS) = {self.global_pose_topic}")
-        print(f" - vehicle_velocity_topic (vehicle original status) = {self.vehicle_velocity_topic}")
-        print(f" - vehicle_steering_topic (vehicle original steering) = {self.vehicle_steering_topic}")
-        print(f" - twist_estimator_topic (modified velocity status) = {self.twist_estimator_topic}")
-        print(f" - imu_topic = {self.imu_topic}")
-        print("---------------------------------")
+        print(f" - vehicle_velocity_topic (vehicle original status)           = {self.vehicle_velocity_topic}")
+        print(f" - vehicle_steering_topic (vehicle original steering)         = {self.vehicle_steering_topic}")
+        print(f" - twist_estimator_topic (modified velocity status)           = {self.twist_estimator_topic}")
+        print(f" - imu_topic                                                  = {self.imu_topic}")
+        print(f" - control_cmd_topic                                          = {self.control_cmd}")
+        print('------------------------------------------------------------------')
+
+        self.over_threshold_warning_message = "!!! CAUTION !!! difference is too large, need calibration."
+
+    def add_data(self, topic, msg, timestamp):
+        # Do not use elif so that duplicated topic name is acceptable.
+            if topic == self.global_pose_topic:
+                self.global_pose_data["data"].append(msg)
+                self.global_pose_data["timestamp"].append(timestamp)
+            if topic == self.vehicle_velocity_topic:
+                self.vehicle_velocity_data["data"].append(msg)
+                self.vehicle_velocity_data["timestamp"].append(timestamp)
+            if topic == self.vehicle_steering_topic:
+                self.vehicle_steering_data["data"].append(msg)
+                self.vehicle_steering_data["timestamp"].append(timestamp)
+            if topic == self.twist_estimator_topic:
+                self.twist_estimator_velocity_data["data"].append(msg)
+                self.twist_estimator_velocity_data["timestamp"].append(timestamp)
+            if topic == self.imu_topic:
+                self.imu_data["data"].append(msg)
+                self.imu_data["timestamp"].append(timestamp)
+            if topic == self.control_cmd:
+                self.control_cmd_data["data"].append(msg)
+                self.control_cmd_data["timestamp"].append(timestamp)
 
     def read_rosbag(self):
-        # rosbagからデータを読み込む
         storage_options = rosbag2_py.StorageOptions(uri=self.rosbag_path, storage_id='sqlite3')
         converter_options = rosbag2_py.ConverterOptions(input_serialization_format='cdr', output_serialization_format='cdr')
         reader = rosbag2_py.SequentialReader()
@@ -75,265 +175,244 @@ class ROSBagAnalyzer(Node):
                 message_type = get_message(type_dict[topic])
             except (ModuleNotFoundError, ImportError) as e:
                 logging.warning(f"Skipping topic {topic} due to missing message module: {e}")
-                continue  # このトピックの処理をスキップ
+                continue
 
-            # メッセージのデシリアライズ
             msg = rclpy.serialization.deserialize_message(data, message_type)
+            timestamp_sec = timestamp * 1e-9  # convert from ms to sec
+            self.add_data(topic, msg, timestamp_sec)
 
-            # Do not use elif so that duplicated topic name is acceptable.
-            if topic == self.global_pose_topic:
-                self.global_pose_data.append((msg, timestamp))
-            if topic == self.vehicle_velocity_topic:
-                self.vehicle_velocity_data.append((msg, timestamp))
-            if topic == self.vehicle_steering_topic:
-                self.vehicle_steering_data.append((msg, timestamp))
-            if topic == self.twist_estimator_topic:
-                self.vehicle_velocity_converted_data.append((msg, timestamp))
-            if topic == self.imu_topic:
-                self.imu_data.append((msg, timestamp))
-
-        print("---------------------------------")
-        print("topic data num:")
-        print(f" - global_pose = {len(self.global_pose_data)}")
-        print(f" - vehicle_velocity = {len(self.vehicle_velocity_data)}")
-        print(f" - vehicle_steering = {len(self.vehicle_steering_data)}")
-        print(f" - twist_estimator = {len(self.vehicle_velocity_converted_data)}")
-        print(f" - imu = {len(self.imu_data)}")
-        print("---------------------------------")
+        print('------------------------------------------------------------------')
+        print('topic data num:')
+        print(f' - global_pose      = {len(self.global_pose_data["data"])}')
+        print(f' - vehicle_velocity = {len(self.vehicle_velocity_data["data"])}')
+        print(f' - vehicle_steering = {len(self.vehicle_steering_data["data"])}')
+        print(f' - twist_estimator  = {len(self.twist_estimator_velocity_data["data"])}')
+        print(f' - imu              = {len(self.imu_data["data"])}')
+        print(f' - control_cmd      = {len(self.control_cmd_data["data"])}')
+        print('------------------------------------------------------------------')
         
-
-    def moving_average(self, data, window_size):
-        """
-        Apply moving average filter
-        Note: with mode='same', the filter is applied for both forward and backward, which does not cause a time delay.
-        """
-        return np.convolve(data, np.ones(window_size)/window_size, mode='same')
+    def show_plot_and_wait_enter(self):
+        plt.grid()
+        plt.legend()
+        plt.pause(0.001)
+        if not self.non_interactive_mode:
+            input("Please check the result. Press Enter to continue.")
+            plt.close()
 
     def calculate_global_pose_derivatives(self):
-        self.global_pose_vx = []
-        self.global_pose_vy = []
-        self.global_pose_yawrate = []
+        if len(self.global_pose_data["data"]) < 2:
+            return
 
-        for i in range(1, len(self.global_pose_data)):
-            prev_pose, prev_time = self.global_pose_data[i - 1]
-            curr_pose, curr_time = self.global_pose_data[i]
+        for i in range(1, len(self.global_pose_data["data"])):
+            prev_pose = self.global_pose_data["data"][i - 1]
+            curr_pose = self.global_pose_data["data"][i]
+            prev_time = self.global_pose_data["timestamp"][i - 1]
+            curr_time = self.global_pose_data["timestamp"][i]
 
-            dt = (curr_time - prev_time) * 1e-9  # タイムスタンプの差を秒に変換
+            dt = curr_time - prev_time
 
-            # x, y, yawの速度を計算
+            # Calculate the velocity in x, y, and yaw directions
             dx = curr_pose.pose.pose.position.x - prev_pose.pose.pose.position.x
             dy = curr_pose.pose.pose.position.y - prev_pose.pose.pose.position.y
             yaw1 = 2 * atan2(prev_pose.pose.pose.orientation.z, prev_pose.pose.pose.orientation.w)
             yaw2 = 2 * atan2(curr_pose.pose.pose.orientation.z, curr_pose.pose.pose.orientation.w)
             
-            # yawの連続性を担保（-πからπにマッピング）
+            # Ensure yaw continuity (mapping between -π and π)
             dyaw = yaw2 - yaw1
-            if dyaw > np.pi:
-                dyaw -= 2 * np.pi
-            elif dyaw < -np.pi:
-                dyaw += 2 * np.pi
+            dyaw = (dyaw + np.pi) % (2 * np.pi) - np.pi
 
             vx = dx / dt
             vy = dy / dt
             yawrate = dyaw / dt
 
-            self.global_pose_vx.append(vx)
-            self.global_pose_vy.append(vy)
-            self.global_pose_yawrate.append(yawrate)
-            self.time_stamps.append(curr_time)
+            # Append velocity and timestamps to the list
+            self.global_pose_vx["data"].append(vx)
+            self.global_pose_vx["timestamp"].append(curr_time)
+            self.global_pose_vy["data"].append(vy)
+            self.global_pose_vy["timestamp"].append(curr_time)
+            self.global_pose_yawrate["data"].append(yawrate)
+            self.global_pose_yawrate["timestamp"].append(curr_time)
+
 
 
     def compare_velocity(self):
-        # グローバルポーズの速度
-        global_pose_v = [hypot(vx, vy) for vx, vy in zip(self.global_pose_vx, self.global_pose_vy)]
-        global_pose_timestamps = [ts * 1e-9 for ts in self.time_stamps]  # タイムスタンプを秒に変換
+        # Global pose velocity
+        global_pose_v = [hypot(vx, vy) for vx, vy in zip(self.global_pose_vx["data"], self.global_pose_vy["data"])]
+        global_pose_timestamps = self.global_pose_vy["timestamp"]
+        smoothed_global_pose_v = moving_average(global_pose_v, self.window_size)
 
-        # smoothed_global_pose_v (移動平均)
-        smoothed_global_pose_v = self.moving_average(global_pose_v, self.window_size)
+        # Vehicle velocity data
+        vehicle_velocity = [data.longitudinal_velocity for data in self.vehicle_velocity_data["data"]]
+        vehicle_velocity_timestamps = self.vehicle_velocity_data["timestamp"]
 
-        # 車両速度のデータ
-        vehicle_velocity = [data.longitudinal_velocity for data, _ in self.vehicle_velocity_data]
-        vehicle_velocity_timestamps = [(ts * 1e-9) for _, ts in self.vehicle_velocity_data]
+        # Twist estimator velocity
+        twist_estimator_velocity = [data.twist.twist.linear.x for data in self.twist_estimator_velocity_data["data"]]
+        twist_estimator_velocity_timestamps = self.twist_estimator_velocity_data["timestamp"]
 
-        # 変換後の車両速度
-        vehicle_velocity_converted = [data.twist.twist.linear.x for data, _ in self.vehicle_velocity_converted_data]
-        vehicle_velocity_converted_timestamps = [(ts * 1e-9) for _, ts in self.vehicle_velocity_converted_data]
+        # Resample using linear interpolation
+        _, [r_global_pose_v, r_twist_estimator_velocity, r_vehicle_velocity] = \
+            resample_data((global_pose_timestamps, smoothed_global_pose_v), \
+                               (twist_estimator_velocity_timestamps, twist_estimator_velocity), \
+                               (vehicle_velocity_timestamps, vehicle_velocity))
 
-        # --- 線形補間によるリサンプリング ---
-        # グローバルポーズと変換後の車両速度を同じ時間軸でリサンプリングする
-        f_smoothed_global_pose_v = interpolate.interp1d(global_pose_timestamps, smoothed_global_pose_v, fill_value="extrapolate")
-        f_vehicle_velocity_converted = interpolate.interp1d(vehicle_velocity_converted_timestamps, vehicle_velocity_converted, fill_value="extrapolate")
-        f_vehicle_velocity = interpolate.interp1d(vehicle_velocity_timestamps, vehicle_velocity, fill_value="extrapolate")
-
-        # 共通の時間軸を決定
-        common_timestamps_converted = np.linspace(max(min(global_pose_timestamps), min(vehicle_velocity_converted_timestamps)),
-                                                  min(max(global_pose_timestamps), max(vehicle_velocity_converted_timestamps)),
-                                                  num=min(len(smoothed_global_pose_v), len(vehicle_velocity_converted)))
-
-        common_timestamps_vehicle = np.linspace(max(min(global_pose_timestamps), min(vehicle_velocity_timestamps)),
-                                                min(max(global_pose_timestamps), max(vehicle_velocity_timestamps)),
-                                                num=min(len(smoothed_global_pose_v), len(vehicle_velocity)))
-
-        # リサンプリングしたデータを取得
-        resampled_global_pose_v_converted = f_smoothed_global_pose_v(common_timestamps_converted)
-        resampled_vehicle_velocity_converted = f_vehicle_velocity_converted(common_timestamps_converted)
-
-        resampled_global_pose_v_vehicle = f_smoothed_global_pose_v(common_timestamps_vehicle)
-        resampled_vehicle_velocity = f_vehicle_velocity(common_timestamps_vehicle)
-
-        # --- 変換後の車両速度が0.01以上のデータに対して差の総和を計算 ---
+        # Ignore stationary data since it is just a noise
         valid_velocity_threshold = 0.01
-        valid_indices_converted = resampled_vehicle_velocity_converted >= valid_velocity_threshold
-        valid_indices_vehicle = resampled_vehicle_velocity >= valid_velocity_threshold
+        valid_indices_estimator = np.abs(r_twist_estimator_velocity) >= valid_velocity_threshold
+        valid_indices_raw = np.abs(r_vehicle_velocity) >= valid_velocity_threshold
 
-        avg_diff_converted = np.mean(np.abs(resampled_global_pose_v_converted[valid_indices_converted] - resampled_vehicle_velocity_converted[valid_indices_converted]))
-        avg_diff_vehicle = np.mean(np.abs(resampled_global_pose_v_vehicle[valid_indices_vehicle] - resampled_vehicle_velocity[valid_indices_vehicle]))
+        avg_diff_converted = np.mean(np.abs(r_global_pose_v[valid_indices_estimator] - r_twist_estimator_velocity[valid_indices_estimator]))
+        avg_diff_vehicle = np.mean(np.abs(r_global_pose_v[valid_indices_raw] - r_vehicle_velocity[valid_indices_raw]))
 
-        # --- smoothed_global_pose_v に最も近づくための倍率を計算（最小二乗法） ---
-        scale_factor_converted = np.sum(resampled_global_pose_v_converted[valid_indices_converted] * resampled_vehicle_velocity_converted[valid_indices_converted]) / \
-                                 np.sum(resampled_vehicle_velocity_converted[valid_indices_converted] ** 2)
+        # Calculate the scale factor using least squares method
+        scale_factor_converted = calculate_scale_factor(r_global_pose_v[valid_indices_estimator], r_twist_estimator_velocity[valid_indices_estimator])
+        scale_factor_vehicle = calculate_scale_factor(r_global_pose_v[valid_indices_raw], r_vehicle_velocity[valid_indices_raw])
 
-        scale_factor_vehicle = np.sum(resampled_global_pose_v_vehicle[valid_indices_vehicle] * resampled_vehicle_velocity[valid_indices_vehicle]) / \
-                               np.sum(resampled_vehicle_velocity[valid_indices_vehicle] ** 2)
-
-
-        print("---------------------------------")
-        velocity_error_threshold = 0.3
-        print("Velocity Analysis:")
+        print('------------------------------------------------------------------')
+        threshold = self.error_threshold["velocity"]
+        print('Velocity Analysis:')
         print(f"- Average difference between global_pose_velocity and twist_estimator_velocity: {avg_diff_converted:.5}.")
-        if avg_diff_converted > velocity_error_threshold:
-            print("!!! CAUTION !!! difference is toot large, need calibration.")
+        if avg_diff_converted > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
         print(f"    - Note: This is performed for data with twist_estimator_velocity >= {valid_velocity_threshold:.3} to ignore noise effect when stationary.")
-        print(f"    - Note: If this value exceeds {velocity_error_threshold:.3}, vehicle velocity is not accurate -> do velocity calibration (apply scale factor, etc.), or global pose is broken -> change data.")
-        print(f"    - Optimal scale factor for vehicle_velocity_converted: {scale_factor_converted:.5}")
+        print(f"    - Note: If this value exceeds {threshold:.3}, vehicle velocity is not accurate -> do velocity calibration (apply scale factor, etc.), or global pose is broken -> change data.")
+        print(f"    - Optimal scale factor for twist_estimator_velocity: {scale_factor_converted:.5}")
         print(f"- Average difference between global_pose_velocity and vehicle_velocity: {avg_diff_vehicle:.5}.")
-        if avg_diff_vehicle > velocity_error_threshold:
-            print("!!! CAUTION !!! difference is toot large, need calibration.")
+        if avg_diff_vehicle > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
         print(f"    - Note: This is performed for data with twist_estimator_velocity >= {valid_velocity_threshold:.3} to ignore noise effect when stationary.")
-        print(f"    - Note: If this value exceeds {velocity_error_threshold:.3}, vehicle velocity is not accurate -> do velocity calibration (apply scale factor, etc.), or global pose is broken -> change data.")
+        print(f"    - Note: If this value exceeds {threshold:.3}, vehicle velocity is not accurate -> do velocity calibration (apply scale factor, etc.), or global pose is broken -> change data.")
         print(f"    - Optimal scale factor for vehicle_velocity: {scale_factor_vehicle:.5}")
-        print("---------------------------------")
+        show_result_messages(avg_diff_vehicle > threshold or avg_diff_converted > threshold)
+        print('------------------------------------------------------------------')
 
-
-        # グローバルポーズの速度プロット
+        plt.figure(self.figure_id)
+        self.figure_id += 1
         plt.plot(global_pose_timestamps, smoothed_global_pose_v, label=f'Global Pose Derivative Velocity (moving average = {self.window_size})')
         plt.plot(vehicle_velocity_timestamps, vehicle_velocity, label='Vehicle Velocity')
-        plt.plot(vehicle_velocity_converted_timestamps, vehicle_velocity_converted, '--', label='Converted Vehicle Velocity')
-        plt.plot(vehicle_velocity_converted_timestamps, np.array(vehicle_velocity_converted) * scale_factor_converted, ':', label=f'Converted Vehicle Velocity (x{scale_factor_converted:.3} scaled))')
-        plt.plot(vehicle_velocity_timestamps, np.array(vehicle_velocity) * scale_factor_vehicle, ':', label=f'Vehicle Velocity (x{scale_factor_vehicle:.3} scaled))')
+        plt.plot(twist_estimator_velocity_timestamps, twist_estimator_velocity, '--', label='Converted Vehicle Velocity')
+        plt.plot(twist_estimator_velocity_timestamps, np.array(twist_estimator_velocity) * scale_factor_converted, '-', label=f'Converted Vehicle Velocity (x{scale_factor_converted:.3} scaled)')
+        plt.plot(vehicle_velocity_timestamps, np.array(vehicle_velocity) * scale_factor_vehicle, '--', label=f'Vehicle Velocity (x{scale_factor_vehicle:.3} scaled)')
 
-        # グラフ設定
         plt.xlabel('Time [s]')
         plt.ylabel('Velocity [m/s]')
-        plt.grid()
-        plt.legend()
-        plt.show()
-
+        self.show_plot_and_wait_enter()
 
     def compare_yawrate(self):
-        # グローバルポーズのyawrate
-        global_pose_yawrate = self.moving_average(self.global_pose_yawrate, self.window_size)
-        global_pose_timestamps = [ts * 1e-9 for ts in self.time_stamps]  # タイムスタンプを秒に変換
+        # Global pose yawrate
+        global_pose_yawrate = moving_average(self.global_pose_yawrate["data"], self.window_size)
+        global_pose_timestamps = self.global_pose_yawrate["timestamp"]
 
-        # IMUデータのyawrate (z軸回転速度)
-        imu_yawrate = [data.angular_velocity.z for data, _ in self.imu_data]
-        imu_timestamps = [(ts * 1e-9) for _, ts in self.imu_data]
+        # IMU yawrate (z-axis rotational velocity)
+        imu_yawrate = [data.angular_velocity.z for data in self.imu_data["data"]]
+        imu_timestamps = self.imu_data["timestamp"]
 
-        # 車両速度とステアリングのデータ
-        vehicle_velocity = [data.longitudinal_velocity for data, _ in self.vehicle_velocity_data]
-        vehicle_steering = [data.steering_tire_angle for data, _ in self.vehicle_steering_data]
-        vehicle_velocity_timestamps = [(ts * 1e-9) for _, ts in self.vehicle_velocity_data]
-        vehicle_steering_timestamps = [(ts * 1e-9) for _, ts in self.vehicle_steering_data]
+        # Vehicle velocity and steering data
+        vehicle_velocity = [data.longitudinal_velocity for data in self.vehicle_velocity_data["data"]]
+        vehicle_steering = [data.steering_tire_angle for data in self.vehicle_steering_data["data"]]
+        vehicle_velocity_timestamps = self.vehicle_velocity_data["timestamp"]
+        vehicle_steering_timestamps = self.vehicle_steering_data["timestamp"]
 
-        # --- 線形補間によるリサンプリング ---
-        # 車両速度とステアリング角度を同じ時間軸でリサンプリング
-        f_vehicle_velocity = interpolate.interp1d(vehicle_velocity_timestamps, vehicle_velocity, fill_value="extrapolate")
-        f_vehicle_steering = interpolate.interp1d(vehicle_steering_timestamps, vehicle_steering, fill_value="extrapolate")
+        # Resample using linear interpolation
+        common_timestamps, [resampled_vehicle_velocity, resampled_vehicle_steering,
+                            resampled_global_pose_yawrate, resampled_imu_yawrate] = \
+            resample_data((vehicle_velocity_timestamps, vehicle_velocity), (vehicle_steering_timestamps, vehicle_steering),
+                          (global_pose_timestamps, global_pose_yawrate), (imu_timestamps, imu_yawrate))
 
-        # 共通の時間軸を決定（車両速度とステアリング）
-        common_vehicle_timestamps = np.linspace(max(min(vehicle_velocity_timestamps), min(vehicle_steering_timestamps)),
-                                                min(max(vehicle_velocity_timestamps), max(vehicle_steering_timestamps)),
-                                                num=min(len(vehicle_velocity), len(vehicle_steering)))
+        # Yaw rate from vehicle kinematics = vehicle_velocity * tan(vehicle_steering) / wheelbase
+        resampled_kinematic_yawrate = resampled_vehicle_velocity * np.tan(resampled_vehicle_steering) / self.wheelbase
 
-        # リサンプリングした車両速度とステアリング角度を取得
-        resampled_vehicle_velocity = f_vehicle_velocity(common_vehicle_timestamps)
-        resampled_vehicle_steering = f_vehicle_steering(common_vehicle_timestamps)
-
-        # 車両キネマティクスによるyaw rate = vehicle_velocity * tan(vehicle_steering) / wheelbase
-        kinematic_yawrate = resampled_vehicle_velocity * np.tan(resampled_vehicle_steering) / self.wheelbase
-
-        # --- 線形補間によるグローバルポーズとIMUのyawrateのリサンプリング ---
-        f_global_pose_yawrate = interpolate.interp1d(global_pose_timestamps, global_pose_yawrate, fill_value="extrapolate")
-        f_imu_yawrate = interpolate.interp1d(imu_timestamps, imu_yawrate, fill_value="extrapolate")
-
-        # 共通の時間軸を決定（グローバルポーズ、IMU、車両キネマティクス）
-        common_timestamps = np.linspace(max(min(global_pose_timestamps), min(imu_timestamps), min(common_vehicle_timestamps)),
-                                        min(max(global_pose_timestamps), max(imu_timestamps), max(common_vehicle_timestamps)),
-                                        num=min(len(global_pose_yawrate), len(imu_yawrate), len(kinematic_yawrate)))
-
-        # リサンプリングしたデータを取得
-        resampled_global_pose_yawrate = f_global_pose_yawrate(common_timestamps)
-        resampled_imu_yawrate = f_imu_yawrate(common_timestamps)
-        resampled_kinematic_yawrate = interpolate.interp1d(common_vehicle_timestamps, kinematic_yawrate, fill_value="extrapolate")(common_timestamps)
-
-        # --- 差分の平均を計算 ---
+        # Calculate the average difference
         avg_diff_yawrate = np.mean(np.abs(resampled_global_pose_yawrate - resampled_imu_yawrate))
         avg_diff_kinematic = np.mean(np.abs(resampled_global_pose_yawrate - resampled_kinematic_yawrate))
         avg_diff_imu_kinematic = np.mean(np.abs(resampled_imu_yawrate - resampled_kinematic_yawrate))
 
-        # --- Optimal scale factor を計算 ---
-        scale_factor_imu = np.sum(resampled_global_pose_yawrate * resampled_imu_yawrate) / np.sum(resampled_imu_yawrate ** 2)
-        scale_factor_kinematic = np.sum(resampled_global_pose_yawrate * resampled_kinematic_yawrate) / np.sum(resampled_kinematic_yawrate ** 2)
-        scale_factor_imu_kinematic = np.sum(resampled_imu_yawrate * resampled_kinematic_yawrate) / np.sum(resampled_kinematic_yawrate ** 2)
+        # Calculate optimal scale factors
+        scale_factor_imu = calculate_scale_factor(resampled_global_pose_yawrate, resampled_imu_yawrate)
+        scale_factor_kinematic = calculate_scale_factor(resampled_global_pose_yawrate, resampled_kinematic_yawrate)
+        scale_factor_imu_kinematic = calculate_scale_factor(resampled_imu_yawrate, resampled_kinematic_yawrate)
 
-
-        print("---------------------------------")
-        yaw_rate_error_threshold = 0.03
-        print("Yaw Rate Analysis:")
+        print('------------------------------------------------------------------')
+        threshold = self.error_threshold["yawrate"]
+        print('Yaw Rate Analysis:')
         print(f" - Average difference between global_pose_yawrate and imu_yawrate: {avg_diff_yawrate:.5}")
-        if avg_diff_yawrate > yaw_rate_error_threshold:
-            print("!!! CAUTION !!! difference is toot large, need calibration.")
-        print(f"    - Note: If this value exceeds {yaw_rate_error_threshold:.3}, imu_yawrate is not accurate -> do IMU calibration (remove bias, etc.), or global pose is broken -> change data.")
+        if avg_diff_yawrate > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
+        print(f"    - Note: If this value exceeds {threshold:.3}, imu_yawrate is not accurate -> do IMU calibration (remove bias, etc.), or global pose is broken -> change data.")
         print(f"    - Optimal scale factor for imu_yawrate: {scale_factor_imu:.5}")
         print(f" - Average difference between global_pose_yawrate and kinematic_yawrate: {avg_diff_kinematic:.5}")
-        if avg_diff_kinematic > yaw_rate_error_threshold:
-            print("!!! CAUTION !!! difference is toot large, need calibration.")
-        print(f"    - Note: If this value exceeds {yaw_rate_error_threshold:.3}, vehicle steering or vehicle velocity is not accurate -> do calibration (remove steering bias, apply steering scale, etc.), or global pose is broken -> change data.")
+        if avg_diff_kinematic > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
+        print(f"    - Note: If this value exceeds {threshold:.3}, vehicle steering or vehicle velocity is not accurate -> do calibration (remove steering bias, apply steering scale, etc.), or global pose is broken -> change data.")
         print(f"    - Optimal scale factor for imu_yawrate: {scale_factor_kinematic:.5}")
         print(f" - Average difference between imu_yawrate and kinematic_yawrate: {avg_diff_imu_kinematic:.5}")
-        if avg_diff_imu_kinematic > yaw_rate_error_threshold:
-            print("!!! CAUTION !!! difference is toot large, need calibration.")
-        print(f"    - Note: If this value exceeds {yaw_rate_error_threshold:.3}, vehicle steering or vehicle velocity or imu yawrate is not accurate -> do calibration with further investigation.")
+        if avg_diff_imu_kinematic > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
+        print(f"    - Note: If this value exceeds {threshold:.3}, vehicle steering or vehicle velocity or imu yawrate is not accurate -> do calibration with further investigation.")
         print(f"    - Optimal scale factor between imu_yawrate and kinematic_yawrate: {scale_factor_imu_kinematic:.5}")
-        print("---------------------------------")
+        show_result_messages(avg_diff_yawrate > threshold or avg_diff_kinematic > threshold or avg_diff_imu_kinematic > threshold)
 
-        # --- プロット ---
-        plt.plot(common_timestamps, resampled_global_pose_yawrate, label=f'Global Pose Yawrate (moving average = {self.window_size})')
-        plt.plot(common_timestamps, resampled_imu_yawrate, '--', label='IMU Yawrate')
-        plt.plot(common_timestamps, resampled_kinematic_yawrate, ':', label=f'Kinematic Yawrate (wheelbase = {self.wheelbase})')
-        plt.plot(common_timestamps, np.array(resampled_kinematic_yawrate) * scale_factor_imu_kinematic, ':', label=f'Kinematic Yawrate (wheelbase = {self.wheelbase}, x{scale_factor_imu_kinematic:.3} scaled)')
+        print('------------------------------------------------------------------')
 
-        # グラフ設定
+        plt.figure(self.figure_id)
+        self.figure_id += 1
+        plt.plot(global_pose_timestamps, global_pose_yawrate, label=f'Global Pose Yawrate (moving average = {self.window_size})')
+        plt.plot(imu_timestamps, imu_yawrate, '-', label='IMU Yawrate')
+        plt.plot(common_timestamps, resampled_kinematic_yawrate, '-', label=f'Kinematic Yawrate (wheelbase = {self.wheelbase})')
+        plt.plot(common_timestamps, np.array(resampled_kinematic_yawrate) * scale_factor_imu_kinematic, '--', label=f'Kinematic Yawrate (wheelbase = {self.wheelbase}, x{scale_factor_imu_kinematic:.3} scaled)')
+
         plt.xlabel('Time [s]')
         plt.ylabel('Yaw Rate [rad/s]')
-        plt.grid()
-        plt.legend()
-        plt.show()
+        self.show_plot_and_wait_enter()
 
+    def compare_steering_angles(self):
+        control_cmd_steering = [data.lateral.steering_tire_angle for data in self.control_cmd_data["data"]]
+        vehicle_steering = [data.steering_tire_angle for data in self.vehicle_steering_data["data"]]
+
+        control_cmd_timestamps = self.control_cmd_data["timestamp"]
+        vehicle_steering_timestamps = self.vehicle_steering_data["timestamp"]
+
+        # Resample using linear interpolation
+        _, [resampled_control_cmd_steering, resampled_vehicle_steering] = \
+            resample_data((control_cmd_timestamps, control_cmd_steering), (vehicle_steering_timestamps, vehicle_steering))
+
+        avg_diff_steering = np.mean(np.abs(resampled_control_cmd_steering - resampled_vehicle_steering))
+
+        print('------------------------------------------------------------------')
+        threshold = self.error_threshold["steering_control"]
+        print( "Steering Angle Control Check:")
+        print(f" - Average difference between control_cmd_steering and vehicle_steering: {avg_diff_steering:.5}")
+        if avg_diff_steering > threshold:
+            print(f"    - {self.over_threshold_warning_message}")
+        print(f"    - Note: If this value exceeds {threshold:.3}, if a bias or scaling is wrong -> perform calibration, or is the oscillation or tracking performance is poor -> do control parameter tuning (e.g. PID gains).")
+        print( "    - Note: If the command and status does not match at all, make sure the data is record in Autonomous mode.")
+        show_result_messages(avg_diff_steering > threshold)
+
+        print('------------------------------------------------------------------')
+
+        plt.figure(self.figure_id)
+        self.figure_id += 1
+        plt.plot(control_cmd_timestamps, control_cmd_steering, label='Control Cmd Steering Angle')
+        plt.plot(vehicle_steering_timestamps, vehicle_steering, '--', label='Vehicle Steering Angle')
+
+        plt.xlabel('Time [s]')
+        plt.ylabel('Steering Angle [rad]')
+        self.show_plot_and_wait_enter()
 
 def main(args=None):
     rclpy.init(args=args)
-
-    # argparseを使用した引数の処理
     parser = argparse.ArgumentParser(description='Analyze rosbag data and compare velocities.')
     parser.add_argument('-r', '--rosbag', type=str, required=True, help='Path to the rosbag file')
+    parser.add_argument('-ni', '--non_interactive_mode', action='store_true', default=False, help='Show all plots at once without waiting for input (default: False)')
     parsed_args = parser.parse_args()
 
-    analyzer = ROSBagAnalyzer(parsed_args.rosbag)
+    analyzer = ROSBagAnalyzer(parsed_args.rosbag, parsed_args.non_interactive_mode)
     analyzer.read_rosbag()
     analyzer.calculate_global_pose_derivatives()
     analyzer.compare_velocity()
     analyzer.compare_yawrate()
+    analyzer.compare_steering_angles()
+
+    input("Press Enter to close.")
 
     rclpy.shutdown()
 
