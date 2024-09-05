@@ -191,6 +191,12 @@ class ROSBagAnalyzer(Node):
         print(f' - control_cmd      = {len(self.control_cmd_data["data"])}')
         print('------------------------------------------------------------------')
         
+        if len(self.global_pose_data["data"]) <= 2 or len(self.vehicle_velocity_data["data"]) <= 2 or \
+            len(self.vehicle_steering_data["data"]) <= 2 or len(self.twist_estimator_velocity_data["data"]) <= 2 or \
+                len(self.imu_data["data"]) <= 2 or len(self.control_cmd_data["data"]) <= 2:
+            raise ValueError(
+                "Data length is too small for more than one data (must be > 2).")
+
     def show_plot_and_wait_enter(self):
         plt.grid()
         plt.legend()
